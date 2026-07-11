@@ -1,0 +1,13 @@
+{
+  "name": "firefox-mcp-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server that drives a real Firefox via a WebExtension over a localhost WebSocket.",
+  "bin": { "firefox-mcp-bridge": "bridge.js" },
+  "scripts": { "start": "node bridge.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "ws": "^8.18.0"
+  }
+}
