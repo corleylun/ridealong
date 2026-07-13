@@ -206,7 +206,61 @@ cd ~/ridealong/bridge && node my_driver.mjs
 
 ---
 
-## 9. Troubleshooting
+## 7. Writing a scraper for a new site
+
+A reusable, site-agnostic method. `bridge/scrape.example.mjs` implements all of it
+end-to-end — copy it and change the selectors; you rarely need to touch the plumbing.
+
+**1. Grant + open.** In the extension popup, set the foreground tab to **Browse**
+(navigate + read) — or **Developer** if you'll use the `--probe`/`run_js` step below.
+Open the target search/listing page in that tab.
+
+**2. Discover the selectors** (the part that's new per site). You need the CSS
+selector for the *repeating item* (card/row/listing), and optionally a "N results"
+heading. Two ways:
+- **Probe with the example:** `node scrape.example.mjs --probe "<url>"` — it uses
+  `run_js` to dump the most common class tokens plus the price/card/item/result-ish
+  ones. (Developer tier; it prompts with the source.)
+- **Manually:** `find` with `{ selector: "[class*='price']", all: true, attr: "class" }`
+  to see real class names + sample text, then narrow to the card selector.
+
+**3. Extract.** `find({ selector: ITEM_SEL, all: true, attr: "href" })` returns
+`{ matches: [{ text, href }, …], count }`. Parse numbers/prices out of each `text`
+with a regex (see `parseNumber()` in the example).
+
+**4. Beat the stale-render trap** (the part that bites everyone). A search SPA often
+swaps results in *after* `navigate` resolves, so a naive `find` reads the OLD page.
+Use a **settle loop**: capture the page's "signature" (heading + item count + a text
+sample) *before* navigating, then poll after navigation until the signature is
+non-empty, **differs from the pre-navigation page**, and is **stable across two
+consecutive polls**. Only then read. A fixed `sleep` is not reliable.
+
+**5. Multiple fields per card.** `find({all})` gives each card's whole `innerText`
+plus **one** attribute. For separate title / price / link fields you have two options:
+- Run several `find({all})` calls (one per sub-selector) and **zip by index** — simple,
+  but positional and imperfect if the counts differ.
+- Use **`run_js`** (Developer tier) to `querySelectorAll` the cards and map each to a
+  precise `{ title, price, link }` in a single call — robust, but always prompts.
+
+**6. Emit.** Print exactly one `RESULTS_JSON:{…}` line to **stdout**; send progress to
+**stderr**. Grep the line back from the caller.
+
+**Data-quality notes (generic, apply to any price/listing scrape):**
+- Parse the currency/unit from the text — don't assume it.
+- Broad queries mix unrelated variants; **filter items by a required keyword** in the
+  title before you aggregate, or a median/min is meaningless.
+- Watch for decoys — accessories-only listings, "style/inspired/replica" items, or
+  opening-bid auctions (start price ≠ final). The cheapest match is often not the thing.
+
+```bash
+cd ~/ridealong/bridge
+ITEM_SEL='.result-card' LINK_ATTR='href' node scrape.example.mjs "https://site/search?q=widget"
+node scrape.example.mjs --probe "https://site/search?q=widget"   # discover selectors first
+```
+
+---
+
+## 8. Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
@@ -221,7 +275,7 @@ cd ~/ridealong/bridge && node my_driver.mjs
 
 ---
 
-## 10. Related
+## 9. Related
 
 - `README.md` — human setup guide.
 - `PLAN.md` — the governance layer's design + adversarial audit trail.
