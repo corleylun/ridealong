@@ -35,6 +35,7 @@ the extension, which does the work in the real browser and replies.
 ## Layout
 - `bridge/bridge.js` — Node MCP server + localhost WebSocket server.
 - `bridge/driver.example.mjs` — a minimal driver-mode example to copy.
+- `bridge/scrape.example.mjs` — a generic results-page scraper (probe → extract → settle).
 - `extension/` — the Firefox WebExtension (background WS client + broker + tab/DOM executor + popup).
 - `AGENT_GUIDE.md` — how an AI agent uses/extends it.
 - `PLAN.md` — the governance layer's design + adversarial audit trail.
@@ -112,7 +113,16 @@ cd ~/ridealong/bridge
 node driver.example.mjs https://example.com    # grant the foreground tab Browse+ first
 ```
 
-The full driver template + conventions are in [AGENT_GUIDE.md §5](AGENT_GUIDE.md).
+To scrape a real results page (probe for selectors → extract items → beat the
+stale-render trap), copy `bridge/scrape.example.mjs`:
+
+```bash
+node scrape.example.mjs --probe "https://site/search?q=widget"        # discover selectors
+ITEM_SEL='.result-card' node scrape.example.mjs "https://site/search?q=widget"
+```
+
+The full driver template + conventions are in [AGENT_GUIDE.md §5](AGENT_GUIDE.md); the
+step-by-step method for a new site is [§7](AGENT_GUIDE.md).
 
 > **Port note:** only one WS server can hold `:8765`. If a bridge/driver is already
 > running, another will fail to bind — check `ss -tlnp | grep 8765` first.
