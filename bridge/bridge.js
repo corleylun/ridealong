@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * firefox-mcp bridge — an MCP server (stdio) that drives a REAL Firefox through a
+ * ridealong bridge — an MCP server (stdio) that drives a REAL Firefox through a
  * WebExtension connected over a localhost WebSocket.
  *
  *   AI agent ──MCP/stdio──▶ this bridge ──ws://127.0.0.1──▶ Firefox extension ──▶ page
@@ -16,7 +16,7 @@
  * stdout is reserved for the MCP protocol — ALL logging goes to stderr.
  */
 
-import { readFileSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -28,7 +28,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 
-const log = (...a) => console.error("[firefox-mcp]", ...a);
+const log = (...a) => console.error("[ridealong]", ...a);
 
 // ── Token + port ────────────────────────────────────────────────────────
 const PORT = Number(process.env.FXMCP_PORT || 8765);
@@ -50,6 +50,30 @@ function resolveToken() {
   return t;
 }
 const TOKEN = resolveToken();
+// NOTE on token rotation (PLAN.md §7): the extension's "Regenerate token" button
+// only rotates ITS OWN storage.local copy — it cannot reach this file. To rotate
+// the bridge side (revoking an honest/stale extension), delete TOKEN_FILE (or set
+// FXMCP_TOKEN) and RESTART this process so it mints/reads a fresh token, then
+// paste the newly printed value into the extension popup.
+
+// ── Audit log — authoritative sink (PLAN.md §6) ────────────────────────────
+// The extension computes the hash chain (seq/prevHash/hash) and streams each
+// sealed record here over the WS connection; this process's only job is durable,
+// append-only persistence to disk (0600), surviving a Firefox/extension restart.
+// A write failure is surfaced loudly and acked back false so the extension can
+// fail closed rather than silently desync its chain (mirrors JoinTab
+// file-sink.ts:76-86).
+const AUDIT_FILE = join(CFG_DIR, "audit-log.jsonl");
+function appendAudit(record) {
+  try {
+    mkdirSync(CFG_DIR, { recursive: true, mode: 0o700 });
+    appendFileSync(AUDIT_FILE, JSON.stringify(record) + "\n", { mode: 0o600 });
+    return { ok: true };
+  } catch (e) {
+    log("AUDIT WRITE FAILED — decision not persisted:", e.message);
+    return { ok: false, error: e.message };
+  }
+}
 
 // ── WebSocket server: the extension connects here ────────────────────────
 let ext = null; // the authenticated extension socket, or null
@@ -88,6 +112,17 @@ wss.on("connection", (ws, req) => {
       }
       return;
     }
+    // Authenticated: an audit record streamed from the extension's broker (its
+    // hash chain — we just persist it durably). Ack so the extension knows
+    // whether to fail closed or fall back to its own IndexedDB sink.
+    if (msg.type === "audit" && msg.auditId != null) {
+      const result = appendAudit(msg.record);
+      try {
+        ws.send(JSON.stringify({ type: "audit_ack", auditId: msg.auditId, ...result }));
+      } catch {}
+      return;
+    }
+
     // Authenticated: this is a reply to a command.
     if (msg.id != null && pending.has(msg.id)) {
       const p = pending.get(msg.id);
@@ -122,19 +157,19 @@ function callExtension(tool, params, timeoutMs = 30000) {
 const TOOLS = [
   {
     name: "list_tabs",
-    description: "List open Firefox tabs (id, active, url, title).",
+    description: "List Firefox tabs (id, title, active; url only for tabs granted Read+). Gated on the FOREGROUND tab's mode (Off there => denied) and scope-limited by the extension's agentTabControl setting: only the foreground tab when off, all tabs when on.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
     name: "navigate",
-    description: "Navigate a tab to a URL (default: the active tab). Waits for load, returns final url + title.",
+    description: "Navigate a tab to a URL. Waits for load, returns final url + title. The extension requires an explicit tabId for this tool (no active-tab fallback) — use list_tabs to find one.",
     inputSchema: {
       type: "object",
       properties: {
         url: { type: "string", description: "URL to open" },
-        tabId: { type: "number", description: "target tab id (optional; default active tab)" },
+        tabId: { type: "number", description: "target tab id (required by the extension's broker)" },
       },
-      required: ["url"], additionalProperties: false,
+      required: ["url", "tabId"], additionalProperties: false,
     },
   },
   {
@@ -161,20 +196,20 @@ const TOOLS = [
   },
   {
     name: "click",
-    description: "Click the first element matching a CSS selector (synthesized click).",
+    description: "Click the first element matching a CSS selector (synthesized click). Requires Assist+ tier and an explicit tabId; the user is prompted per action unless auto-approve is on for that tab.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string" }, tabId: { type: "number" } },
-      required: ["selector"], additionalProperties: false,
+      properties: { selector: { type: "string" }, tabId: { type: "number", description: "required" } },
+      required: ["selector", "tabId"], additionalProperties: false,
     },
   },
   {
     name: "fill",
-    description: "Set the value of an input/textarea matching a selector and fire input/change events.",
+    description: "Set the value of an input/textarea matching a selector and fire input/change events. Requires Assist+ tier and an explicit tabId; the user is prompted per action unless auto-approve is on for that tab.",
     inputSchema: {
       type: "object",
-      properties: { selector: { type: "string" }, value: { type: "string" }, tabId: { type: "number" } },
-      required: ["selector", "value"], additionalProperties: false,
+      properties: { selector: { type: "string" }, value: { type: "string" }, tabId: { type: "number", description: "required" } },
+      required: ["selector", "value", "tabId"], additionalProperties: false,
     },
   },
   {
@@ -188,6 +223,27 @@ const TOOLS = [
         tabId: { type: "number" },
       },
       required: ["selector"], additionalProperties: false,
+    },
+  },
+  {
+    name: "get_mode",
+    description: "Read-only: get the extension's current permission mode for a tab (default: active/foreground tab). Mode is off-the-ladder and can ONLY be changed by the human via the extension popup — never over MCP/WS, by design.",
+    inputSchema: {
+      type: "object",
+      properties: { tabId: { type: "number", description: "target tab id (optional; default active tab)" } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "run_js",
+    description: "Run arbitrary JS in a tab. Gated behind the extension's Developer tier and ALWAYS prompts the user with the exact source in a trusted approval window before running, regardless of any auto-approve setting. Requires an explicit tabId (no active-tab fallback).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tabId: { type: "number", description: "target tab id (required)" },
+        code: { type: "string", description: "JS to run, wrapped in an IIFE; `return` works as expected" },
+      },
+      required: ["tabId", "code"], additionalProperties: false,
     },
   },
   {
@@ -206,7 +262,7 @@ const TOOLS = [
 
 // ── MCP server ────────────────────────────────────────────────────────────
 const server = new Server(
-  { name: "firefox-mcp", version: "0.1.0" },
+  { name: "ridealong", version: "0.1.0" },
   { capabilities: { tools: {} } },
 );
 
@@ -215,15 +271,30 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }))
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name, arguments: args = {} } = req.params;
   try {
-    // ebay_sold_count is composed here from primitive extension ops.
+    // ebay_sold_count is composed here from primitive extension ops. PLAN.md §2:
+    // this is "not enforceable at the extension" as a single unit — the extension
+    // only ever sees the decomposed navigate/wait_for/find calls, and the ladder
+    // gates it via those (navigate needs Browse+; the audit log records
+    // "navigate", not "ebay_sold_count"). Since navigate now REQUIRES an explicit
+    // tabId (no active-tab fallback, PLAN.md §4), we resolve the foreground tab id
+    // via list_tabs first and thread it through every sub-call — this also means
+    // the foreground tab must be granted Read+ (for list_tabs) and Browse+ (for
+    // navigate) before this composite tool works.
     if (name === "ebay_sold_count") {
       const domain = (args.domain || "www.ebay.co.uk").replace(/^https?:\/\//, "");
       const url = `https://${domain}/sch/i.html?_nkw=${encodeURIComponent(args.term)}&LH_Sold=1&LH_Complete=1`;
-      await callExtension("navigate", { url }, 45000);
-      await callExtension("wait_for", { selector: ".srp-controls__count-heading, .result-count__count-heading, h1", timeoutMs: 12000 }, 15000)
+      const tabsRes = await callExtension("list_tabs", {});
+      const activeTab = (tabsRes.tabs || []).find((t) => t.active) || (tabsRes.tabs || [])[0];
+      if (!activeTab) {
+        throw new Error("no active tab visible to list_tabs — grant the foreground tab Read+ mode in the extension popup first");
+      }
+      const tabId = activeTab.id;
+      await callExtension("navigate", { url, tabId }, 45000);
+      await callExtension("wait_for", { selector: ".srp-controls__count-heading, .result-count__count-heading, h1", timeoutMs: 12000, tabId }, 15000)
         .catch(() => {});
       const hit = await callExtension("find", {
         selector: ".srp-controls__count-heading, .result-count__count-heading",
+        tabId,
       });
       const text = (hit && hit.text) || "";
       const m = text.replace(/,/g, "").match(/([\d]+)/);
