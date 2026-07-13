@@ -1,13 +1,13 @@
-# firefox-mcp — Agent Guide
+# ridealong — Agent Guide
 
 **Audience:** an AI agent (Claude Code, Codex, etc.) that needs to read/drive a
-**real, logged-in Firefox** — to scrape sites that block automation (eBay Seller
-Hub, Yahoo! Japan, Buyee, marketplaces behind Cloudflare), or to act on a user's
+**real, logged-in Firefox** — to reach sites that block automation (marketplaces
+behind Cloudflare, anything checking for automation), or to act on a user's
 authenticated session.
 
 **Why it exists:** headless automation (Electron/Playwright/Puppeteer) and plain
 `curl`/WebFetch get fingerprinted and blocked — CDP attached, `navigator.webdriver`,
-datacenter IP, etc. firefox-mcp runs commands **inside the user's genuine Firefox**
+datacenter IP, etc. ridealong runs commands **inside the user's genuine Firefox**
 (real fingerprint, real cookies, **no CDP**), so the site sees an ordinary browser.
 It is **not a stealth tool** — it's simply the real browser, driven politely.
 
@@ -27,11 +27,10 @@ it **dials OUT** over a WebSocket. Two ways to use that:
   a WS server the extension connects to. The agent calls MCP tools; the bridge
   relays them to the extension.
 - **(B) Driver mode** — a standalone `.mjs` script **is** the WS server (skipping
-  the MCP layer) and sends commands to the extension directly. **This is the
-  workhorse** — it works from any Bash shell with no MCP registration, and it's how
-  all the existing scrapers run.
+  the MCP layer) and sends commands to the extension directly. It works from any Bash
+  shell with no MCP registration; see `bridge/driver.example.mjs`.
 
-**Prefer Driver mode (B)** unless firefox-mcp is already registered as an MCP server
+**Prefer Driver mode (B)** unless ridealong is already registered as an MCP server
 in your session. It's more flexible and needs no session restart.
 
 ---
@@ -65,12 +64,11 @@ Targeting rules that changed:
   can tell it has no access). **Mode can only be changed by a human in the popup —
   there is no way to grant/escalate a tab's mode over MCP/WS/driver.**
 
-**Practical upshot for the existing scrapers in `bridge/`:** they predate this
-gate and don't know about modes. Before running one, open the extension popup,
-find the tab it will drive (or the tab that's currently foreground), and set its
-mode to at least **Browse** (most scrapers `navigate` + `read_page`/`find`) — the
-`click`/`fill`-based flows need **Assist** and will pop a trusted approval window
-per action unless you tick that tab's auto-approve checkbox first.
+**Practical upshot when driving a tab:** open the extension popup, find the tab you
+will drive (or the tab that's currently foreground), and set its mode to at least
+**Browse** for `navigate` + `read_page`/`find`. `click`/`fill` need **Assist** and
+pop a trusted approval window per action unless you tick that tab's auto-approve
+checkbox first; `run_js` needs **Developer** and always prompts with the source.
 
 ## 3. Prerequisites (must be true for ANYTHING to work)
 
@@ -96,26 +94,30 @@ no way to drive Firefox without the user's browser + loaded extension.
 
 ## 4. Mode A — MCP tools
 
-Register once (needs a session restart to appear as `mcp__firefox-mcp__*` tools):
+Register once (needs a session restart to appear as `mcp__ridealong__*` tools):
 ```bash
-claude mcp add firefox-mcp -- node ~/dev/tools/firefox-mcp/bridge/bridge.js
+claude mcp add ridealong -- node ~/ridealong/bridge/bridge.js
 ```
 
-Tools exposed by `bridge.js`:
+Tools exposed by `bridge.js` (each gated by the target tab's mode — see §2):
 
 | Tool | Params | Returns |
 | --- | --- | --- |
-| `list_tabs` | — | open tabs (id, active, url, title) |
-| `navigate` | `{url, tabId?}` | opens URL, waits for load, `{url, title}` |
+| `list_tabs` | — | tabs (id, active, title; `url` only for tabs at ≥ Read) |
+| `get_mode` | `{tabId?}` | `{tabId, mode}` (read-only; off-the-ladder) |
+| `navigate` | `{url, tabId}` | opens URL, waits for load, `{url, title}` |
 | `read_page` | `{tabId?}` | `{url, title, text (≤8k), links[]}` |
 | `find` | `{selector, all?, attr?, tabId?}` | element text (+ optional attr); `all` → `{matches[], count}` |
-| `click` | `{selector, tabId?}` | `{clicked}` |
-| `fill` | `{selector, value, tabId?}` | `{filled}` |
+| `click` | `{selector, tabId}` | `{clicked}` |
+| `fill` | `{selector, value, tabId}` | `{filled}` |
 | `wait_for` | `{selector, timeoutMs?, tabId?}` | `{found}` |
+| `run_js` | `{code, tabId}` | `{result}` — Developer tier; always prompts with the source |
 | `ebay_sold_count` | `{term, domain?}` | convenience: navigate eBay sold-search → `{count, raw, url}` |
 
-No `run_js` is exposed (structured tools only — safer). If you need custom DOM logic,
-either add a tool to `bridge.js` or use Driver mode with a bespoke `find`/read flow.
+`run_js` runs arbitrary JS in the tab and is gated behind the **Developer** tier with a
+mandatory trusted-window approval showing the exact source — use it for custom DOM logic
+without adding a bespoke tool. For anything reusable, prefer adding a structured tool to
+`bridge.js` + `background.js`.
 
 ---
 
@@ -124,9 +126,10 @@ either add a tool to `bridge.js` or use Driver mode with a bespoke `find`/read f
 A driver `.mjs` binds `ws://127.0.0.1:8765`, waits for the extension to connect
 (`hello`→`welcome`), then sends `{id, tool, params}` and awaits `{id, ok, output}`.
 The tools are the **same names** the extension's `background.js` dispatches:
-`list_tabs, navigate, read_page, find, click, fill, wait_for`.
+`list_tabs, get_mode, navigate, read_page, find, click, fill, wait_for, run_js`.
+A ready-to-run copy of this template lives at `bridge/driver.example.mjs`.
 
-### Minimal driver template (copy this to write a new scraper)
+### Minimal driver template (copy this to write a new driver)
 ```js
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -155,9 +158,12 @@ setTimeout(() => { log("overall timeout"); process.exit(1); }, 120000);  // neve
 let ran = false;
 async function run() {
   if (ran) return; ran = true;                 // guard: extension may reconnect & re-fire
-  await call("navigate", { url: "https://example.com" });
+  const { tabs = [] } = await call("list_tabs", {});   // navigate needs an explicit tabId
+  const tab = tabs.find((t) => t.active) || tabs[0];
+  if (!tab) { log("no tab — grant the foreground tab Read+ in the popup"); process.exit(1); }
+  await call("navigate", { url: "https://example.com", tabId: tab.id });
   await sleep(3000);
-  const page = await call("read_page");
+  const page = await call("read_page", { tabId: tab.id });
   console.log("RESULTS_JSON:" + JSON.stringify({ title: page.title }));  // machine-readable line
   process.exit(0);
 }
@@ -166,10 +172,10 @@ log("waiting for extension…");
 
 Run it (from `bridge/` so `ws` resolves):
 ```bash
-cd ~/dev/tools/firefox-mcp/bridge && node my_driver.mjs
+cd ~/ridealong/bridge && node my_driver.mjs
 ```
 
-**Conventions the existing scrapers follow:**
+**Conventions the template follows:**
 - Log progress to **stderr** (`console.error`), print the final machine-readable
   result to **stdout** as one `RESULTS_JSON:{...}` line (grep it back).
 - Always set an **overall timeout** so a cron/agent call can't hang.
@@ -177,99 +183,26 @@ cd ~/dev/tools/firefox-mcp/bridge && node my_driver.mjs
 
 ---
 
-## 6. The existing scrapers (in `bridge/`)
+## 6. Driver-mode gotchas (READ THIS)
 
-| Script | Purpose | Key env / args |
-| --- | --- | --- |
-| `driver.mjs` | eBay SOLD median + count for search terms | `EBAY_DOMAIN` (www.ebay.co.uk / www.ebay.com), `EBAY_COND` (1000=New, 3000=Used), `GBP_PER_USD`, `FXMCP_DELAY_MS`; args = terms |
-| `jp_driver.mjs` | Buyee/HLJ BUY prices (min + median GBP) | `SITE_URL_TPL` (`{q}` placeholder), `PRICE_SEL`, `PRICE_CCY` (JPY/GBP), `GBP_JPY`; args = terms |
-| `verify.mjs` | eBay sold **title-filtered** (edit its `ITEMS` array) | in-file config |
-| `buyee_cheap.mjs` | cheapest genuine Buyee listings | args: `"query" "keyword"` |
-| `buyee_links.mjs` | Buyee listings **with item links** | args: `"query" "keyword" maxGBP` |
-| `peek.mjs` | dump current tab (or navigate first) | optional arg: url |
-| `watch_auction.mjs` | log a Buyee auction's price/bids/time | args: `url logfile` |
-
-Each prints a `RESULTS_JSON:` line (except peek/watch which log directly).
-
----
-
-## 7. Hard-won lessons & gotchas (READ THIS)
-
-**Site access**
-- **Yahoo! Japan geo-blocks the UK/EEA** — `auctions.yahoo.co.jp` returns a notice
-  page. Use **Buyee** (`buyee.jp`), which mirrors Yahoo Auctions + Mercari and is
-  UK-accessible. Buyee is also how a UK user would actually buy.
-- **Buyee/eBay block plain `curl`/WebFetch** (0 bytes / Cloudflare). You MUST go
-  through the real Firefox for these.
-- **eBay Seller Hub / Terapeak** requires the account to be enrolled in Seller Hub,
-  and it aggressively challenges automation — even the real browser can trip it if
-  you navigate too fast. Public **sold-search** pages (`&LH_Sold=1`) are far more
-  lenient than Seller Hub.
-
-**Selectors (they drift — verify with a probe first)**
-- eBay results price: **`.su-item-card__price`** (old `.s-item__price` is dead).
-  Result count heading: `.srp-controls__count-heading`. Item card: `.su-item-card`.
-- Buyee price: **`.g-price`** (text like `"71,500 YEN"`); item cards: `.itemCard`;
-  item links match `/item/(jdirectitems|yahoo)/auction/` or `/item/mercari/`.
-- HLJ price: **`.price`** (already shows GBP if the browser is set to £).
-- When unsure, **probe**: `find` with `[class*='price']` / `[class*='rice']` and
-  `attr:"class"` to discover the real class + sample text.
-
-**The stale-render trap (critical for multi-term scrapes)**
-Navigating a search SPA, `navigate` can resolve before the NEW results render, so a
-`find` reads the OLD page. Fix: **wait until BOTH the count heading AND the price
-list change** from the previous term before accepting the read (see `readState()` /
-the settle loop in `driver.mjs`). Capture the starting page's state first so even the
-first term waits for a real change. The first term can still miss ("no settle") if
-the page didn't change enough — re-pull it or seed a throwaway first term.
-
-**Data quality**
-- **Broad-term medians LIE.** A generic search mixes cheap variants (drag the buy
-  median down) with pricey ones (push the sell median up), inventing fake margins.
-  Always **drill to a specific model** and **title-filter** (keep only cards whose
-  title contains required keywords — see `verify.mjs`). 0 genuine matches = no market.
-- **Currency:** parse the symbol. `.co.uk`=£, `.com`=$ (convert via `GBP_PER_USD`),
-  Buyee=¥ (convert via `GBP_JPY`). Filter to one currency for a clean median.
-- **Decoys:** cheap listings are often the wrong thing — a *nib only*, *case only*,
-  a *kids/"mini"* version, a *"style/inspired/replica"* fake, or a ¥1-start auction
-  (opening bid ≠ final price). Read titles; don't trust the raw minimum.
-
-**Behaviour / safety**
-- **Pace it** — `FXMCP_DELAY_MS=8000` between navigations. It's a real logged-in
-  account; hammering risks bot-challenges or rate limits.
-- **executeJavaScript is an expression** (internal to the extension) — no top-level
-  `return`; wrap awaited logic in an async IIFE `(async()=>{…})()`. Only relevant if
-  you extend `background.js`.
-- **Link↔price pairing is positional** in `buyee_links.mjs` and imperfect — give the
-  user the sorted search URL + a couple sample item links, not a guaranteed map.
-
----
-
-## 8. Common recipes
-
-```bash
-cd ~/dev/tools/firefox-mcp/bridge
-
-# eBay UK used-sold median for specific models
-EBAY_COND=3000 FXMCP_DELAY_MS=8000 node driver.mjs "Daiwa Certate LT3000" "Pilot Custom 823"
-
-# eBay US sold (converts $→£)
-EBAY_DOMAIN=www.ebay.com FXMCP_DELAY_MS=8000 node driver.mjs "Burberry Sandringham trench"
-
-# Buyee (Japan secondhand) buy prices
-FXMCP_DELAY_MS=8000 node jp_driver.mjs "真骨彫 カイザ 555" "Pilot Custom 74"
-
-# HLJ new-retail (GBP)
-PRICE_CCY=GBP PRICE_SEL=".price" SITE_URL_TPL="https://www.hlj.com/search/?Word={q}" node jp_driver.mjs "PG Gundam"
-
-# cheapest genuine listings + links
-node buyee_cheap.mjs "真骨彫 カイザ 555" "カイザ"
-node buyee_links.mjs "Pilot Custom 74 万年筆" "custom 74" 60
-
-# read whatever tab the user is on (e.g. a seller's page)
-node peek.mjs
-node peek.mjs "https://buyee.jp/item/search/query/..."
-```
+- **navigate / click / fill / run_js require an explicit `tabId`.** There is no
+  active-tab fallback — resolve one from `list_tabs` first. With `agentTabControl`
+  OFF (default), that id must be the **foreground** tab; background tabs are
+  untargetable.
+- **The stale-render trap.** Navigating a search SPA, `navigate` can resolve before
+  the NEW content renders, so a `find` reads the OLD page. Don't trust a fixed
+  `sleep` — **wait until the content you expect actually changes** (e.g. a count
+  heading AND a result list both differ from the previous page) before accepting the
+  read.
+- **Injected code is an expression.** The extension wraps your `run_js` code in an
+  IIFE, so `return` works — but wrap awaited logic in an async IIFE
+  `(async()=>{…})()`.
+- **Privileged pages** (`about:`, `view-source:`, PDF viewer, `moz-extension://`)
+  can't be scripted — calls fail closed with an "unsupported page" error.
+- **Pace navigations** on real logged-in sites; hammering risks bot-challenges or
+  rate limits.
+- **Selectors drift** — when unsure, probe with `find` using `[class*='…']` and
+  `attr:"class"` to discover the real class + sample text before hardcoding it.
 
 ---
 
@@ -282,18 +215,15 @@ node peek.mjs "https://buyee.jp/item/search/query/..."
 | Extension connects then nothing | Token mismatch — popup token ≠ `~/.firefox-mcp/token.txt`. |
 | Every call fails with `insufficient_mode` / `... requires Read+/Browse+/...` | The target tab defaults to **Off**. Ask the user to open the extension popup and grant that tab a mode (§2). This is expected on a fresh tab, not a bug. |
 | `click`/`fill` hangs, or `run_js` never returns | A trusted approval popup window opened and is waiting on the human (§2) — it does NOT appear as a page overlay, so it's easy to miss. Ask the user to check for a small extra Firefox window, or enable auto-approve for that tab (`run_js` always prompts regardless). |
-| `navigate`/`click`/`fill` errors with "requires an explicit tabId" | These tools no longer fall back to the active tab — call `list_tabs` first and pass its `id` explicitly (§2). |
-| Prices misaligned across terms | Stale-render trap — use the both-changed settle (see §6). |
-| Median looks wrong / too low | Contamination — title-filter (`verify.mjs`) and drill to a specific model. |
-| eBay "Pardon our interruption" | Bot challenge — you navigated too fast, or it's Seller Hub. Slow down; prefer public sold-search. |
-| Japan page shows EEA/UK notice | Direct Yahoo JP is geo-blocked — use Buyee. |
+| `navigate`/`click`/`fill` errors with "requires an explicit tabId" | These tools don't fall back to the active tab — call `list_tabs` first and pass its `id` explicitly (§2). |
+| A `find` reads stale content after `navigate` | Stale-render trap — wait until the expected content changes, not a fixed sleep (§6). |
+| `error: could not run on this tab (privileged/internal page…)` | The tab is an `about:`/`view-source:`/PDF/`moz-extension://` page — not scriptable (§6). |
 
 ---
 
 ## 10. Related
 
 - `README.md` — human setup guide.
-- The `/resale-research` Claude skill (`~/.claude/skills/resale-research/`) drives
-  these scrapers for Japan→UK / UK→overseas resale vetting; its lessons overlap §6.
+- `PLAN.md` — the governance layer's design + adversarial audit trail.
 - The extension's capabilities live in `extension/background.js` (`dispatch()`); add
   new tools there + mirror them in `bridge.js`'s `TOOLS` for MCP mode.

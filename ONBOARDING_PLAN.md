@@ -1,7 +1,9 @@
 # Plan — Agent-driven onboarding ("paste this into your AI") for ridealong (enhanced Tier-1)
 
-**Status:** design / discussion. Nothing implemented. Builds on the current Tier-1 WS
-version (on `main`); needs **no** native messaging.
+**Status:** ⚙️ **Popup onboarding implemented** on `main` — the popup mints a token, renders
+the self-describing one-paste prompt with a Copy button, and does connect-state detection
+(`extension/popup.js` / `popup.html`). The cross-repo **docs site** page (§6) is the remaining
+open item. Builds on the Tier-1 WS version; needs **no** native messaging.
 
 **Goal:** collapse the fiddly setup (clone → `npm install` → register MCP → copy token →
 paste token) into: **the user copies one self-describing block from the popup into their

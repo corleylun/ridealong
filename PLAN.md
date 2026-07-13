@@ -1,6 +1,9 @@
 # Plan — Tier 1 permission + audit layer for ridealong (firefox-mcp)
 
-**Status:** design / discussion. Nothing implemented yet.
+**Status:** ✅ **Implemented** on `main` — the broker, per-tab mode ladder, trusted-chrome
+approval, session epoch, kill switch, and hash-chained audit all live in
+`extension/background.js` (`dispatch()`) and `bridge/bridge.js`. This document is kept as
+the design rationale + adversarial audit trail; the code is the source of truth.
 **Revised** after an adversarial Opus audit (see §12) — the approval surface, the
 `list_tabs` leak, the audit sink, and several honesty caveats were corrected.
 **Goal:** give the extension the *safety/governance spine* of JoinTab/SafeCoBrowser
@@ -212,7 +215,7 @@ the sink backwards — `storage.local` is the *weakest* link, not the authoritat
 
 **Revised sink hierarchy:**
 - **Authoritative: the bridge file sink** (when present, i.e. MCP mode) — the extension
-  streams each record to `bridge.js`, which appends to `~/.ridealong/audit-log.jsonl`,
+  streams each record to `bridge.js`, which appends to `~/.firefox-mcp/audit-log.jsonl`,
   `0600`, on disk, surviving restart. Reuse JoinTab's `file-sink.ts` design **including its
   write-failure surfacing and fail-closed policy** (`file-sink.ts:76-86`).
 - **Fallback: the extension** (driver mode has no bridge) — **IndexedDB** (not
