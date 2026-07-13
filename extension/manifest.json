@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Ridealong",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lets a local AI agent co-browse THIS Firefox (navigate/read/query/click/fill), gated per-tab with approval + a full audit log. Real browser, real session, no CDP.",
   "permissions": ["tabs", "activeTab", "storage", "unlimitedStorage", "<all_urls>"],
   "icons": {
