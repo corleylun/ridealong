@@ -75,6 +75,29 @@ function appendAudit(record) {
   }
 }
 
+// Last sealed record in the authoritative file (PLAN.md §6). Sent to the
+// extension on connect so it can RESUME its in-memory hash chain instead of
+// restarting at seq=1/GENESIS after a background-script restart — otherwise the
+// file gains a spurious GENESIS discontinuity mid-stream and stops verifying.
+function readAuditTail() {
+  try {
+    if (!existsSync(AUDIT_FILE)) return null;
+    const lines = readFileSync(AUDIT_FILE, "utf8").split("\n");
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const rec = JSON.parse(line);
+      if (typeof rec.seq === "number" && typeof rec.hash === "string") {
+        return { seq: rec.seq, hash: rec.hash };
+      }
+      return null; // newest line is malformed — don't scan further, resume disabled
+    }
+  } catch (e) {
+    log("could not read audit tail (chain resume disabled this connect):", e.message);
+  }
+  return null;
+}
+
 // ── WebSocket server: the extension connects here ────────────────────────
 let ext = null; // the authenticated extension socket, or null
 let seq = 0;
@@ -103,9 +126,15 @@ wss.on("connection", (ws, req) => {
     if (!authed) {
       if (msg.type === "hello" && msg.token === TOKEN) {
         authed = true;
+        // Newest client wins: actively evict the previous socket so a stale (or
+        // rogue) prior extension can't keep streaming audit records / resolving
+        // pending command ids into our shared maps after being superseded.
+        if (ext && ext !== ws) { try { ext.close(); } catch {} }
         ext = ws;
         log("extension connected + authenticated");
-        ws.send(JSON.stringify({ type: "welcome" }));
+        // Include the authoritative chain tail so the extension resumes rather
+        // than restarts its hash chain (see readAuditTail).
+        ws.send(JSON.stringify({ type: "welcome", audit: readAuditTail() }));
       } else {
         log("auth failed — closing socket");
         ws.close();
@@ -152,6 +181,13 @@ function callExtension(tool, params, timeoutMs = 30000) {
     ext.send(JSON.stringify({ id, tool, params }));
   });
 }
+
+// Per-tool bridge-side timeouts. navigate MUST exceed the extension's own
+// internal load wait (waitForComplete = 40s in background.js) — otherwise a page
+// that loads in 31–40s makes the bridge reject with "timed out" while the
+// extension is still working and its eventual reply is dropped. Everything else
+// uses callExtension's 30s default.
+const TOOL_TIMEOUTS = { navigate: 45000 };
 
 // ── MCP tool definitions (raw JSON Schema — no extra deps) ────────────────
 const TOOLS = [
@@ -303,7 +339,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         content: [{ type: "text", text: JSON.stringify({ term: args.term, count, raw: text, url }) }],
       };
     }
-    const output = await callExtension(name, args);
+    const output = await callExtension(name, args, TOOL_TIMEOUTS[name]);
     return { content: [{ type: "text", text: JSON.stringify(output) }] };
   } catch (e) {
     return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
