@@ -54,7 +54,14 @@ async function connect() {
   ws.onmessage = async (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
-    if (msg.type === "welcome") { setStatus("connected", `port ${port}`); return; }
+    if (msg.type === "welcome") {
+      setStatus("connected", `port ${port}`);
+      // Bridge mode: resume the hash chain forward from the authoritative file
+      // tail so a background-script restart doesn't re-open the chain at GENESIS.
+      // (Driver mode sends no audit tail; IndexedDB rehydration covers that.)
+      if (msg.audit) resumeChainFrom(msg.audit.seq, msg.audit.hash);
+      return;
+    }
     if (msg.type === "audit_ack") {
       const p = auditPending.get(msg.auditId);
       if (p) {
@@ -437,6 +444,38 @@ function commitChain(sealed) {
   auditPrevHash = sealed.hash;
 }
 
+// ── chain resume (PLAN.md §6) ──────────────────────────────────────────────
+// auditSeq/auditPrevHash live only in this (persistent, but restartable) page.
+// After a background restart they'd reset to 0/GENESIS while the durable sinks
+// already hold higher seqs — the next sealed record would then re-open the chain
+// at GENESIS mid-stream and fail verification. We resume forward-only from the
+// highest tail we can find: the bridge's authoritative file (via the welcome
+// message, bridge mode) and/or the IndexedDB fallback store (driver mode). Only
+// ever advances — never rewinds a chain that's already ahead in memory.
+function resumeChainFrom(seq, hash) {
+  if (typeof seq === "number" && Number.isFinite(seq) && seq > auditSeq
+      && typeof hash === "string" && hash) {
+    auditSeq = seq;
+    auditPrevHash = hash;
+  }
+}
+
+async function rehydrateChainFromIndexedDb() {
+  try {
+    const db = await openAuditDb();
+    const rec = await new Promise((resolve, reject) => {
+      // keyPath is "seq" (numeric) — a reverse cursor's first hit is the max seq.
+      const req = db.transaction(AUDIT_STORE, "readonly").objectStore(AUDIT_STORE)
+        .openCursor(null, "prev");
+      req.onsuccess = () => resolve(req.result ? req.result.value : null);
+      req.onerror = () => reject(req.error);
+    });
+    if (rec) resumeChainFrom(rec.seq, rec.hash);
+  } catch (e) {
+    console.error("[ridealong] chain rehydrate from IndexedDB failed:", e);
+  }
+}
+
 function sendAuditToBridge(sealed) {
   return new Promise((resolve, reject) => {
     if (!ws || ws.readyState !== WebSocket.OPEN) { reject(new Error("no bridge connection")); return; }
@@ -511,7 +550,14 @@ async function auditRotateIfNeeded(db) {
   });
 }
 
+// Kick off local-store rehydration once, now that the IndexedDB helpers above are
+// initialized. The first seal awaits this so no record is minted at a stale seq
+// (0/GENESIS) before the fallback store has been consulted (driver mode). Bridge
+// mode additionally resumes from the welcome message's authoritative file tail.
+const chainReady = rehydrateChainFromIndexedDb();
+
 async function auditLog(partial) {
+  await chainReady;
   const sealed = await sealRecord(partial);
   try {
     await sendAuditToBridge(sealed);
