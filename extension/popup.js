@@ -1,10 +1,103 @@
 const $ = (id) => document.getElementById(id);
 
+// ── onboarding prompt (ONBOARDING_PLAN.md §2 — reproduce verbatim, token filled in) ──
+function buildPrompt(token) {
+  return (
+`Ridealong is installed in this Firefox and wants you (the AI agent) to finish setup so you
+can drive this browser over MCP. You are on the user's LOCAL machine (same machine as
+Firefox). Please do the following, explaining each step to the user as you go:
+
+1. Clone the repo if it isn't already present:
+     git clone https://github.com/corleylun/ridealong.git
+2. Install the bridge dependencies:
+     cd ridealong/bridge && npm install
+3. Register a stdio MCP server named "ridealong" that runs:
+     node <ABSOLUTE_PATH>/ridealong/bridge/bridge.js
+   with this environment variable set (do NOT change it — the extension already holds this
+   exact token and will only connect to a bridge that uses it):
+     FXMCP_TOKEN=${token}
+   - If you are Claude Code:
+       claude mcp add ridealong --env FXMCP_TOKEN=${token} -- node <ABSOLUTE_PATH>/ridealong/bridge/bridge.js
+   - If you are Codex (near-identical):
+       codex mcp add ridealong --env FXMCP_TOKEN=${token} -- node <ABSOLUTE_PATH>/ridealong/bridge/bridge.js
+4. Tell the user to RESTART you so the MCP server loads, then have them open the Ridealong
+   popup in Firefox — it should show "connected".
+5. Once connected: every tab is OFF by default. The user grants you a permission mode per
+   tab from the popup (Read / Browse / Assist / Developer); effectful actions may need their
+   approval. Full docs + troubleshooting: https://flowstations.net/ridealong/docs
+
+Security note for the user: this makes your AI agent clone a repo, run npm install, and
+register a local MCP server that can act in your logged-in Firefox — only within the per-tab
+permission you grant, off by default, with a full audit log. Read the steps before running.`
+  );
+}
+
+// ── token minting (ONBOARDING_PLAN.md §3) ──────────────────────────────────
+// ~32 bytes, hex-encoded — stored under the SAME `token` key connectWs() (background.js)
+// already reads, so minting here is all that's needed for the extension to auto-connect
+// once a bridge is started with this same value as FXMCP_TOKEN.
+function genToken() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+let mintedToken = "";
+let onboardingCollapsed = false; // becomes true once we've hidden onboarding this session
+
+/**
+ * Mints a token into storage.local.token if none exists yet (fresh install).
+ * Returns true iff it MINTED a fresh token (storage was empty) — the caller uses
+ * that to force the onboarding view, because a freshly-minted token means the bridge
+ * (if any) still holds the OLD/other token and the user must re-register (LOW #1).
+ */
+async function ensureToken() {
+  const c = await browser.storage.local.get(["token"]);
+  if (c.token) { mintedToken = c.token; return false; }
+  mintedToken = genToken();
+  await browser.storage.local.set({ token: mintedToken });
+  return true;
+}
+
+function paintOnboarding() {
+  $("onboardPrompt").value = buildPrompt(mintedToken);
+  $("mintedTokenDisplay").value = mintedToken;
+}
+
+/** Toggles between the onboarding view and the normal per-tab/status view. */
+function setOnboardingVisible(visible) {
+  $("onboarding").style.display = visible ? "" : "none";
+  $("mainView").style.display = visible ? "none" : "";
+  onboardingCollapsed = !visible;
+}
+
 async function load() {
-  const c = await browser.storage.local.get(["port", "token"]);
+  const freshlyMinted = await ensureToken();
+  const c = await browser.storage.local.get(["port", "token", "everConnected"]);
   if (c.port) $("port").value = c.port;
-  if (c.token) $("token").value = c.token;
-  refresh();
+  $("token").value = c.token || mintedToken;
+  paintOnboarding();
+
+  // HIGH fix: on a fresh profile, background.js's startup connect() was skipped (no
+  // token existed then), and minting a token does not itself dial. Kick off dialing
+  // now so the extension's reconnect loop is live and will latch onto the bridge the
+  // moment the agent starts it — otherwise the "switches to connected automatically"
+  // promise is false for exactly the target user. Guard against a duplicate dial:
+  // background's connect() reassigns `ws` WITHOUT closing an existing socket, so only
+  // dial when we are not already connected/connecting.
+  const s = await browser.runtime.sendMessage({ cmd: "status" }).catch(() => null);
+  if (!s || (s.status !== "connected" && s.status !== "connecting")) {
+    browser.runtime.sendMessage({ cmd: "connect" });
+  }
+
+  // State detection (ONBOARDING_PLAN.md §4): show onboarding unless this profile has
+  // ever completed a successful connection before (persisted, not just live status —
+  // a later disconnect/bridge restart should NOT re-show the onboarding wizard). But a
+  // freshly-minted token (storage was cleared) always forces onboarding back on, even
+  // if everConnected was set, because the bridge no longer shares this new token and
+  // the user must re-register (LOW #1).
+  setOnboardingVisible(freshlyMinted || !c.everConnected);
+  if (s) render(s);
   refreshTabs();
 }
 
@@ -12,6 +105,10 @@ function render(s) {
   const el = $("status");
   el.className = s.status;
   el.textContent = s.status + (s.detail ? ` — ${s.detail}` : "");
+  if (s.status === "connected" && !onboardingCollapsed) {
+    setOnboardingVisible(false);
+    browser.storage.local.set({ everConnected: true });
+  }
 }
 
 async function refresh() {
@@ -62,11 +159,37 @@ async function refreshTabs() {
   }
 }
 
+$("copyPrompt").addEventListener("click", async () => {
+  const text = $("onboardPrompt").value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // Fallback if the async Clipboard API is unavailable in this popup context.
+    $("onboardPrompt").focus();
+    $("onboardPrompt").select();
+    document.execCommand("copy");
+  }
+  const flash = $("copiedFlash");
+  flash.style.display = "";
+  clearTimeout(flash.__hideTimer);
+  flash.__hideTimer = setTimeout(() => { flash.style.display = "none"; }, 1500);
+});
+
+$("toggleTokenReveal").addEventListener("click", () => {
+  const input = $("mintedTokenDisplay");
+  const btn = $("toggleTokenReveal");
+  const revealed = input.type === "text";
+  input.type = revealed ? "password" : "text";
+  btn.textContent = revealed ? "Show" : "Hide";
+});
+
 $("connect").addEventListener("click", async () => {
+  const tok = $("token").value.trim();
   await browser.storage.local.set({
     port: Number($("port").value) || 8765,
-    token: $("token").value.trim(),
+    token: tok,
   });
+  if (tok) { mintedToken = tok; paintOnboarding(); }
   browser.runtime.sendMessage({ cmd: "connect" });
   setTimeout(refresh, 500);
 });
@@ -102,13 +225,21 @@ $("stopAI").addEventListener("click", () => {
 $("regenToken").addEventListener("click", async () => {
   const res = await browser.runtime.sendMessage({ cmd: "regenerate_token" }).catch(() => null);
   if (res && res.token) {
+    mintedToken = res.token;
     $("token").value = res.token;
+    paintOnboarding();
+    // LOW #2: Regenerate lives in mainView, where the onboarding prompt is hidden.
+    // Surface the onboarding view so the "updated prompt" the alert points at is
+    // actually on screen (with the new token already filled in) for the user to copy.
+    setOnboardingVisible(true);
     alert(
       "Token rotated LOCALLY (this extension only). The bridge/driver still has the " +
         "OLD token in ~/.firefox-mcp/token.txt and won't recognize this new one.\n\n" +
         "This immediately revokes this extension's access to an honest/stale bridge. " +
-        "To reconnect, regenerate the bridge's token file (delete it and restart the " +
-        "bridge/driver) and paste ITS new printed token in here.",
+        "To reconnect, either regenerate the bridge's token file (delete it and restart " +
+        "the bridge/driver) and paste ITS new printed token in here, or use the onboarding " +
+        "prompt now shown above (updated with the new token) — copy it and have your agent " +
+        "re-register.",
     );
   }
   refresh();
