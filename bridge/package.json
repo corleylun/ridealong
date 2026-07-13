@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "MCP server that drives a real Firefox via a WebExtension over a localhost WebSocket.",
   "bin": { "ridealong-bridge": "bridge.js" },
   "scripts": { "start": "node bridge.js" },
