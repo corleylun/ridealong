@@ -3,32 +3,74 @@
 <head>
   <meta charset="utf-8" />
   <style>
-    body { font: 13px system-ui, sans-serif; width: 260px; margin: 0; padding: 12px; }
+    body { font: 13px system-ui, sans-serif; width: 300px; margin: 0; padding: 12px; }
     h1 { font-size: 14px; margin: 0 0 8px; }
+    h2 { font-size: 12px; margin: 14px 0 4px; color: #333; border-top: 1px solid #eee; padding-top: 10px; }
     label { display: block; margin: 8px 0 2px; color: #555; }
-    input { width: 100%; box-sizing: border-box; padding: 5px; }
+    input[type=text], input[type=number], select { width: 100%; box-sizing: border-box; padding: 5px; }
     .row { display: flex; gap: 6px; margin-top: 10px; }
+    .checkline { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+    .checkline input { width: auto; }
     button { flex: 1; padding: 6px; cursor: pointer; }
     #status { margin-top: 10px; padding: 6px; border-radius: 4px; text-align: center; font-weight: 600; }
     .connected { background: #e6f4ea; color: #137333; }
     .disconnected, .error { background: #fce8e6; color: #c5221f; }
     .connecting { background: #fef7e0; color: #b06000; }
     .hint { color: #888; font-size: 11px; margin-top: 8px; }
+    #stopAI { background: #c5221f; color: #fff; font-weight: 700; padding: 8px; }
+    #tabList { max-height: 130px; overflow-y: auto; border: 1px solid #eee; border-radius: 4px; margin-top: 4px; }
+    .tabRow { display: flex; align-items: center; justify-content: space-between; gap: 6px;
+      padding: 4px 6px; border-bottom: 1px solid #f2f2f2; }
+    .tabRow:last-child { border-bottom: none; }
+    .tabRow span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+    .tabRow select { width: auto; flex: 0 0 auto; }
   </style>
 </head>
 <body>
-  <h1>Firefox MCP Bridge</h1>
+  <h1>Ridealong</h1>
   <label>Port</label>
   <input id="port" type="number" value="8765" />
   <label>Token</label>
   <input id="token" type="text" placeholder="paste token from the bridge" />
   <div class="row">
     <button id="connect">Save &amp; Connect</button>
-    <button id="disconnect">Disconnect</button>
+    <button id="disconnect">Disconnect agent</button>
   </div>
   <div id="status" class="disconnected">disconnected</div>
+
+  <h2>This tab (<span id="thisTabTitle">…</span>)</h2>
+  <label>Mode</label>
+  <select id="thisTabMode">
+    <option value="Off">Off</option>
+    <option value="Read">Read</option>
+    <option value="Browse">Browse</option>
+    <option value="Assist">Assist</option>
+    <option value="Developer">Developer</option>
+  </select>
+  <div class="checkline">
+    <input id="thisTabAutoApprove" type="checkbox" />
+    <label style="margin:0">Auto-approve click/fill on this tab (run_js always prompts)</label>
+  </div>
+
+  <div class="row">
+    <button id="stopAI">Stop AI (all tabs → Off)</button>
+  </div>
+
+  <h2>Settings</h2>
+  <div class="checkline">
+    <input id="agentTabControl" type="checkbox" />
+    <label style="margin:0">agentTabControl — allow multi-tab targeting (default OFF = foreground tab only)</label>
+  </div>
+  <div class="row">
+    <button id="regenToken">Regenerate token (local)</button>
+  </div>
+
+  <h2>All tabs</h2>
+  <div id="tabList"></div>
+
   <div class="hint">The bridge prints the token on startup (and saves it to
-    ~/.firefox-mcp/token.txt). Localhost only.</div>
+    ~/.firefox-mcp/token.txt). Localhost only. Every tab defaults to Off — grant a
+    tab a mode here before an agent can touch it.</div>
   <script src="popup.js"></script>
 </body>
 </html>

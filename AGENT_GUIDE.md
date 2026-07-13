@@ -36,7 +36,43 @@ in your session. It's more flexible and needs no session restart.
 
 ---
 
-## 2. Prerequisites (must be true for ANYTHING to work)
+## 2. Permission ladder (read this before your first call ever fails)
+
+The extension now gates every tool call through a per-tab broker
+(`extension/background.js` `dispatch()` — see `PLAN.md` for the full design/audit
+trail). **Every tab defaults to Off**, which denies ALL tools on that tab — this
+is new and it is not a bug if your driver script suddenly gets `insufficient_mode`
+errors. A human must open the extension popup and grant the tab a mode before any
+agent (MCP or driver) can touch it:
+
+| Mode | Unlocks | Approval |
+| --- | --- | --- |
+| Off (default) | nothing | — |
+| Read | `read_page`, `find`, `wait_for`, `list_tabs`, `get_mode` | no |
+| Browse | + `navigate` | no |
+| Assist | + `click`, `fill` | yes, per action (trusted popup window), unless auto-approve is on for that tab |
+| Developer | + `run_js` | yes, always — shows the exact source, ignores auto-approve |
+
+Targeting rules that changed:
+- `click`, `fill`, `run_js`, and `navigate` now **require an explicit `tabId`** —
+  no active-tab fallback. Get one from `list_tabs` first.
+- `list_tabs` is Read-tier, gated on the **foreground** tab's mode, and returns
+  reduced fields (`id`+`title` always; `url` only for tabs individually at ≥ Read).
+  With the extension's `agentTabControl` setting OFF (the default), it — and every
+  other tool — is confined to the single foreground tab; background tabs are
+  invisible/untargetable even if granted.
+- `get_mode` is read-only and off-the-ladder (works even on an Off tab so an agent
+  can tell it has no access). **Mode can only be changed by a human in the popup —
+  there is no way to grant/escalate a tab's mode over MCP/WS/driver.**
+
+**Practical upshot for the existing scrapers in `bridge/`:** they predate this
+gate and don't know about modes. Before running one, open the extension popup,
+find the tab it will drive (or the tab that's currently foreground), and set its
+mode to at least **Browse** (most scrapers `navigate` + `read_page`/`find`) — the
+`click`/`fill`-based flows need **Assist** and will pop a trusted approval window
+per action unless you tick that tab's auto-approve checkbox first.
+
+## 3. Prerequisites (must be true for ANYTHING to work)
 
 1. **Firefox is open** on the user's machine.
 2. **The extension is loaded** (`about:debugging#/runtime/this-firefox` → Load
@@ -58,7 +94,7 @@ no way to drive Firefox without the user's browser + loaded extension.
 
 ---
 
-## 3. Mode A — MCP tools
+## 4. Mode A — MCP tools
 
 Register once (needs a session restart to appear as `mcp__firefox-mcp__*` tools):
 ```bash
@@ -83,7 +119,7 @@ either add a tool to `bridge.js` or use Driver mode with a bespoke `find`/read f
 
 ---
 
-## 4. Mode B — Driver scripts (the workhorse)
+## 5. Mode B — Driver scripts (the workhorse)
 
 A driver `.mjs` binds `ws://127.0.0.1:8765`, waits for the extension to connect
 (`hello`→`welcome`), then sends `{id, tool, params}` and awaits `{id, ok, output}`.
@@ -141,7 +177,7 @@ cd ~/dev/tools/firefox-mcp/bridge && node my_driver.mjs
 
 ---
 
-## 5. The existing scrapers (in `bridge/`)
+## 6. The existing scrapers (in `bridge/`)
 
 | Script | Purpose | Key env / args |
 | --- | --- | --- |
@@ -157,7 +193,7 @@ Each prints a `RESULTS_JSON:` line (except peek/watch which log directly).
 
 ---
 
-## 6. Hard-won lessons & gotchas (READ THIS)
+## 7. Hard-won lessons & gotchas (READ THIS)
 
 **Site access**
 - **Yahoo! Japan geo-blocks the UK/EEA** — `auctions.yahoo.co.jp` returns a notice
@@ -209,7 +245,7 @@ the page didn't change enough — re-pull it or seed a throwaway first term.
 
 ---
 
-## 7. Common recipes
+## 8. Common recipes
 
 ```bash
 cd ~/dev/tools/firefox-mcp/bridge
@@ -237,13 +273,16 @@ node peek.mjs "https://buyee.jp/item/search/query/..."
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
 | Driver hangs at "waiting for extension…" | Firefox closed, extension not loaded, or not connected (popup not green). Confirm with the user. |
 | `ws error: EADDRINUSE` | Something already on 8765 (a bridge/monitor). Check `ss -tlnp \| grep 8765`; kill only if safe. |
 | Extension connects then nothing | Token mismatch — popup token ≠ `~/.firefox-mcp/token.txt`. |
+| Every call fails with `insufficient_mode` / `... requires Read+/Browse+/...` | The target tab defaults to **Off**. Ask the user to open the extension popup and grant that tab a mode (§2). This is expected on a fresh tab, not a bug. |
+| `click`/`fill` hangs, or `run_js` never returns | A trusted approval popup window opened and is waiting on the human (§2) — it does NOT appear as a page overlay, so it's easy to miss. Ask the user to check for a small extra Firefox window, or enable auto-approve for that tab (`run_js` always prompts regardless). |
+| `navigate`/`click`/`fill` errors with "requires an explicit tabId" | These tools no longer fall back to the active tab — call `list_tabs` first and pass its `id` explicitly (§2). |
 | Prices misaligned across terms | Stale-render trap — use the both-changed settle (see §6). |
 | Median looks wrong / too low | Contamination — title-filter (`verify.mjs`) and drill to a specific model. |
 | eBay "Pardon our interruption" | Bot challenge — you navigated too fast, or it's Seller Hub. Slow down; prefer public sold-search. |
@@ -251,7 +290,7 @@ node peek.mjs "https://buyee.jp/item/search/query/..."
 
 ---
 
-## 9. Related
+## 10. Related
 
 - `README.md` — human setup guide.
 - The `/resale-research` Claude skill (`~/.claude/skills/resale-research/`) drives

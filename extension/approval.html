@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Approve action — Firefox MCP Bridge</title>
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 420px; margin: 0; padding: 14px; }
+    h1 { font-size: 14px; margin: 0 0 8px; }
+    .tab { color: #555; margin-bottom: 8px; }
+    .effect { background: #f4f4f4; border: 1px solid #ddd; border-radius: 4px; padding: 8px;
+      font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word;
+      max-height: 180px; overflow: auto; }
+    .row { display: flex; gap: 8px; margin-top: 12px; }
+    button { flex: 1; padding: 8px; cursor: pointer; font-weight: 600; }
+    #approve { background: #e6f4ea; border: 1px solid #137333; }
+    #deny { background: #fce8e6; border: 1px solid #c5221f; }
+    .hint { color: #888; font-size: 11px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Agent wants to: <span id="tool">…</span></h1>
+  <div class="tab">Tab: <span id="tab">…</span></div>
+  <div class="effect" id="effect">…</div>
+  <div class="row">
+    <button id="approve">Approve</button>
+    <button id="deny">Deny</button>
+  </div>
+  <div class="hint">This is trusted extension chrome, not a page overlay — the web
+    page cannot see, trigger, or auto-click this prompt. Closing this window (or
+    waiting) denies the action.</div>
+  <script src="approval.js"></script>
+</body>
+</html>
