@@ -4,12 +4,27 @@
   "version": "0.1.0",
   "description": "Lets a local AI agent co-browse THIS Firefox (navigate/read/query/click/fill), gated per-tab with approval + a full audit log. Real browser, real session, no CDP.",
   "permissions": ["tabs", "activeTab", "storage", "unlimitedStorage", "<all_urls>"],
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
+  },
   "background": { "scripts": ["background.js"], "persistent": true },
   "browser_action": {
     "default_popup": "popup.html",
-    "default_title": "Ridealong"
+    "default_title": "Ridealong",
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    }
   },
   "browser_specific_settings": {
-    "gecko": { "id": "ridealong@corleylun", "strict_min_version": "115.0" }
+    "gecko": {
+      "id": "ridealong@corleylun",
+      "strict_min_version": "115.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
   }
 }
