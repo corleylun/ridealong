@@ -222,13 +222,13 @@ async function resolveTarget(tool, p) {
   if (EFFECTFUL_OR_NAV.has(tool)) {
     // Explicit tabId required in BOTH configs (the half-wired-invariant fix).
     if (p.tabId == null) {
-      throw denyErr("explicit_tabid_required", tool + " requires an explicit tabId (no active-tab fallback)");
+      throw denyErr("explicit_tabid_required", tool + " requires an explicit tabId. → Call list_tabs first to get a tabId, then pass it as the tabId argument.");
     }
     if (!settings.agentTabControl && p.tabId !== fg) {
-      throw denyErr("tab_control_off", "agentTabControl is OFF: only the foreground tab is reachable");
+      throw denyErr("tab_control_off", "agentTabControl is OFF, so only the foreground (active) tab is reachable. → Ask the user to switch to the tab they want you to use, or to enable multi-tab access in the Ridealong popup settings.");
     }
     if (!(await tabExists(p.tabId))) {
-      throw denyErr("tab_unavailable", "target tab is not available");
+      throw denyErr("tab_unavailable", "that tabId is not an open tab. → Call list_tabs to get a current tabId.");
     }
     return p.tabId;
   }
@@ -236,13 +236,13 @@ async function resolveTarget(tool, p) {
   // Read-only tools (+ get_mode): active-tab fallback permitted.
   if (!settings.agentTabControl) {
     if (p.tabId != null && p.tabId !== fg) {
-      throw denyErr("tab_control_off", "agentTabControl is OFF: only the foreground tab is reachable");
+      throw denyErr("tab_control_off", "agentTabControl is OFF, so only the foreground (active) tab is reachable. → Ask the user to switch to the tab they want you to use, or to enable multi-tab access in the Ridealong popup settings.");
     }
     return fg;
   }
   if (p.tabId != null) {
     if (!(await tabExists(p.tabId))) {
-      throw denyErr("tab_unavailable", "target tab is not available");
+      throw denyErr("tab_unavailable", "that tabId is not an open tab. → Call list_tabs to get a current tabId.");
     }
     return p.tabId;
   }
@@ -636,7 +636,7 @@ async function dispatch(tool, p) {
     const st = getTabState(targetTabId);
     const required = TOOL_TIER[tool];
     if (rank(st.mode) < required) {
-      throw denyErr("insufficient_mode", tool + " requires " + MODE_NAMES[required] + "+, tab is " + st.mode);
+      throw denyErr("insufficient_mode", tool + " needs the '" + MODE_NAMES[required] + "' permission tier or higher, but this tab is currently '" + st.mode + "'. → Ask the user to open the Ridealong popup and set THIS tab to '" + MODE_NAMES[required] + "' (or higher), then retry this exact call. You cannot change the mode yourself.");
     }
 
     // 3. Input validation.

@@ -91,6 +91,15 @@
       <button id="stopAI">Stop AI (all tabs → Off)</button>
     </div>
 
+    <h2>Agent usage primer</h2>
+    <div class="hint">Paste this into any new Claude/Codex session so it knows how to drive
+      Firefox — tabs are Off by default, the permission ladder, and how to recover from denials.
+      (Weaker agents like Codex especially need it.)</div>
+    <div class="row">
+      <button id="copyPrimer" type="button">Copy usage primer</button>
+    </div>
+    <span id="primerFlash" class="hint" style="display:none">Copied &#10003;</span>
+
     <h2>Settings</h2>
     <div class="checkline">
       <input id="agentTabControl" type="checkbox" />
