@@ -609,15 +609,26 @@ function cleanupEndpoint() {
   }
 }
 
+// HTTP MCP port: FIXED + env-configurable (FXMCP_HTTP_PORT), default 8766. A stable port
+// lets agents register the URL ONCE and have it survive restarts / systemd cycles (the
+// bearer token in endpoint.json also persists). Set FXMCP_HTTP_PORT=0 for a dynamic port.
+const HTTP_PORT_PREF = process.env.FXMCP_HTTP_PORT != null
+  ? parseInt(process.env.FXMCP_HTTP_PORT, 10)
+  : 8766;
 const httpServer = createHttpMcpServer();
 await new Promise((resolve, reject) => {
   httpServer.once("error", (e) => {
-    log("HTTP MCP server error:", e.message);
+    if (e.code === "EADDRINUSE") {
+      log(`HTTP MCP port ${HTTP_PORT_PREF} is already in use — another ridealong bridge running? ` +
+          `Stop it, or set FXMCP_HTTP_PORT to a free port (or 0 for a dynamic port).`);
+    } else {
+      log("HTTP MCP server error:", e.message);
+    }
     reject(e);
   });
-  httpServer.listen(0, "127.0.0.1", resolve); // dynamic free port — never hardcoded
+  httpServer.listen(HTTP_PORT_PREF, "127.0.0.1", resolve);
 });
-const HTTP_PORT = httpServer.address().port;
+const HTTP_PORT = httpServer.address().port; // the actually-bound port (== pref unless 0)
 httpAuthConfig = buildAuthConfig(HTTP_TOKEN, HTTP_PORT);
 const MCP_URL = `http://127.0.0.1:${HTTP_PORT}/mcp`;
 

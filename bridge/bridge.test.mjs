@@ -144,6 +144,7 @@ function authedHeaders(extra = {}) {
 before(async () => {
   cfgDir = mkdtempSync(join(tmpdir(), "ridealong-bridge-test-"));
   wsPort = await freePort(); // a private WS port so this never fights a real bridge on :8765
+  const httpPort = await freePort(); // private HTTP port too, so it never hits the 8766 default
   const endpointFile = join(cfgDir, "endpoint.json");
 
   child = spawn(process.execPath, [BRIDGE_JS], {
@@ -151,6 +152,7 @@ before(async () => {
       ...process.env,
       FXMCP_CFG_DIR: cfgDir,
       FXMCP_PORT: String(wsPort),
+      FXMCP_HTTP_PORT: String(httpPort),
       // No FXMCP_TOKEN override here (deliberately): passing one short-circuits
       // resolveToken() before it ever persists token.txt (see bridge.js), and we
       // want to exercise the real mint-and-persist path for both token files.
