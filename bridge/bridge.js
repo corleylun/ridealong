@@ -185,9 +185,15 @@ function callExtension(tool, params, timeoutMs = 30000) {
 // Per-tool bridge-side timeouts. navigate MUST exceed the extension's own
 // internal load wait (waitForComplete = 40s in background.js) — otherwise a page
 // that loads in 31–40s makes the bridge reject with "timed out" while the
-// extension is still working and its eventual reply is dropped. Everything else
-// uses callExtension's 30s default.
-const TOOL_TIMEOUTS = { navigate: 45000 };
+// extension is still working and its eventual reply is dropped.
+//
+// The approval-gated tools (run_js/click/fill) block on a HUMAN, who has up to
+// the extension's approvalTimeoutMs (default 120s) to read the prompt and click.
+// The bridge must wait longer than that whole window or it rejects with "timed
+// out" while the popup is still open — dropping the reply even after the human
+// approves. 130s = 120s approval budget + execution margin. Everything else uses
+// callExtension's 30s default.
+const TOOL_TIMEOUTS = { navigate: 45000, run_js: 130000, click: 130000, fill: 130000 };
 
 // ── MCP tool definitions (raw JSON Schema — no extra deps) ────────────────
 const TOOLS = [

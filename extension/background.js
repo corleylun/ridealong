@@ -875,9 +875,17 @@ browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   // Everything below is a control-plane action. It must originate from trusted
   // extension chrome (popup.html / approval.html), never a content script — a
   // hostile page could otherwise use redact.js's extension-code privileges to
-  // relay a fake approval/mode message (PLAN.md §5). Content scripts always carry
-  // a sender.tab; popup/approval pages never do.
-  if (sender.tab) return;
+  // relay a fake approval/mode message (PLAN.md §5). Distinguish by the sender's
+  // URL ORIGIN, not the presence of sender.tab: a windows.create approval popup
+  // carries a sender.tab on some Firefox builds, so the old `if (sender.tab) return;`
+  // silently dropped every approval_get_detail/approval_decision message here —
+  // before the switch — leaving the Approve/Deny buttons dead ("(expired)"). A
+  // content script's sender.url is always the http(s) page; our own chrome is
+  // moz-extension://<this-extension>/… and (no web_accessible_resources) is
+  // unreachable/unspoofable from a web page.
+  const fromExtensionChrome =
+    typeof sender.url === "string" && sender.url.startsWith(browser.runtime.getURL(""));
+  if (!fromExtensionChrome) return;
 
   switch (msg.cmd) {
     case "get_tab_states": {
