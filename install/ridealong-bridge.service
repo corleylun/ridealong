@@ -1,0 +1,44 @@
+# ridealong bridge — systemd user unit (the "always-on" story).
+#
+# Runs `bridge/bridge.js` as a long-lived service instead of a per-agent stdio
+# subprocess: the extension-facing WebSocket (:8765) and the agent-facing
+# MCP-over-HTTP server (dynamic port, see ~/.firefox-mcp/endpoint.json) both stay
+# up across agent sessions, so multiple agents (Claude, Codex, ...) can share one
+# running bridge instead of each launching (and fighting over :8765 for) their own.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp install/ridealong-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ridealong-bridge
+#
+# Then point agents at the printed HTTP endpoint (see `journalctl --user -u
+# ridealong-bridge -f` for the startup log, or read ~/.firefox-mcp/endpoint.json
+# directly for the mcpUrl + bearer token):
+#   claude mcp add --transport http ridealong <mcpUrl> --header "Authorization: Bearer <token>"
+#   codex  mcp add --transport http ridealong <mcpUrl> --header "Authorization: Bearer <token>"
+#
+# Logs:    journalctl --user -u ridealong-bridge -f
+# Stop:    systemctl --user stop ridealong-bridge
+# Disable: systemctl --user disable --now ridealong-bridge
+#
+# Note: %h expands to the invoking user's home directory. If this repo lives
+# somewhere other than ~/dev/tools/firefox-mcp, edit ExecStart below to match.
+
+[Unit]
+Description=ridealong bridge (Firefox MCP bridge — WS extension relay + MCP-over-HTTP)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/node %h/dev/tools/firefox-mcp/bridge/bridge.js
+Restart=always
+RestartSec=3
+# stdout is reserved for the stdio MCP protocol (see bridge.js) — nothing meant
+# for a human is ever written there, so journald capturing it is harmless; all
+# actual logging goes to stderr, also captured by journald.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

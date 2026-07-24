@@ -32,6 +32,32 @@ permission you grant, off by default, with a full audit log. Read the steps befo
   );
 }
 
+// ── agent usage primer (procedural — for a NEW session to drive Firefox) ──────
+// The setup prompt (above) registers the MCP server once. This primer orients an
+// agent that already HAS the tools on the per-tab permission model, so weaker agents
+// (e.g. Codex) follow the workflow and recover from denials instead of stalling.
+function buildUsagePrimer() {
+  return (
+`You have the "ridealong" MCP tools that control the user's real, logged-in Firefox.
+Follow this exact sequence — do not skip steps:
+
+1. Call list_tabs to see the tabs you're allowed to use.
+2. If list_tabs is empty or denied, STOP and tell the user: "Open the Ridealong popup and
+   set the tab you want me to use to at least 'Read'." Then wait for them.
+3. To READ a page: call read_page (or find) with a tabId from list_tabs.
+4. To CLICK or FILL: the tab must be at 'Assist'. Call click/fill with the explicit tabId.
+   The user gets an approval popup — tell them to approve it.
+5. If any tool returns an error containing "→", DO WHAT THE ARROW SAYS (it tells you the
+   exact recovery step — usually "ask the user to set THIS tab to <mode> in the popup, then
+   retry"). Then retry the same call.
+6. You can NEVER change a tab's permission mode yourself — only the user can, in the popup.
+   Never assume access to a tab you weren't granted.
+
+Full tool reference: https://flowstations.net/ridealong/docs`
+  );
+}
+
+
 // ── token minting (ONBOARDING_PLAN.md §3) ──────────────────────────────────
 // ~32 bytes, hex-encoded — stored under the SAME `token` key connectWs() (background.js)
 // already reads, so minting here is all that's needed for the extension to auto-connect
@@ -174,6 +200,23 @@ $("copyPrompt").addEventListener("click", async () => {
   clearTimeout(flash.__hideTimer);
   flash.__hideTimer = setTimeout(() => { flash.style.display = "none"; }, 1500);
 });
+
+$("copyPrimer").addEventListener("click", async () => {
+  const text = buildUsagePrimer();
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    // Fallback: stash in a temporary textarea and execCommand copy.
+    const ta = document.createElement("textarea");
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); ta.remove();
+  }
+  const flash = $("primerFlash");
+  flash.style.display = "";
+  clearTimeout(flash.__hideTimer);
+  flash.__hideTimer = setTimeout(() => { flash.style.display = "none"; }, 1500);
+});
+
 
 $("toggleTokenReveal").addEventListener("click", () => {
   const input = $("mintedTokenDisplay");

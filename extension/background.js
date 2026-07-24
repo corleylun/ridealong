@@ -37,21 +37,41 @@ async function getConfig() {
   return { port: c.port || DEFAULTS.port, token: c.token || DEFAULTS.token };
 }
 
+// Silently drop the current socket: detach ALL its handlers (esp. onclose) so its
+// close never triggers a reconnect, then close it. This is the fix for the
+// connect/disconnect loop — see connect().
+function teardownSocket() {
+  if (!ws) return;
+  const old = ws;
+  ws = null;
+  try { old.onopen = old.onmessage = old.onerror = old.onclose = null; old.close(); } catch {}
+}
+
 async function connect() {
   desired = true;
   clearTimeout(reconnectTimer);
+  // Idempotent: if we already hold an OPEN socket, a redundant connect() (e.g. the
+  // popup dialing on open) is a no-op — don't churn a working connection.
+  if (ws && ws.readyState === WebSocket.OPEN) return;
   const { port, token } = await getConfig();
   if (!token) { setStatus("error", "no token set"); return; }
+  // Never keep two live sockets. Tear the old one down SILENTLY first — otherwise
+  // opening a second socket makes the bridge evict the first ("newest wins"), whose
+  // onclose would fire scheduleReconnect → connect → a new socket → eviction → an
+  // endless connect/disconnect loop.
+  teardownSocket();
+  let sock;
   try {
-    ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    sock = new WebSocket(`ws://127.0.0.1:${port}`);
   } catch (e) {
     setStatus("error", String(e));
     scheduleReconnect();
     return;
   }
+  ws = sock;
   setStatus("connecting", `port ${port}`);
-  ws.onopen = () => ws.send(JSON.stringify({ type: "hello", token }));
-  ws.onmessage = async (ev) => {
+  sock.onopen = () => sock.send(JSON.stringify({ type: "hello", token }));
+  sock.onmessage = async (ev) => {
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if (msg.type === "welcome") {
@@ -74,14 +94,21 @@ async function connect() {
     if (msg.id != null && msg.tool) {
       try {
         const output = await dispatch(msg.tool, msg.params || {});
-        ws.send(JSON.stringify({ id: msg.id, ok: true, output }));
+        sock.send(JSON.stringify({ id: msg.id, ok: true, output }));
       } catch (e) {
-        ws.send(JSON.stringify({ id: msg.id, ok: false, error: String(e && e.message || e) }));
+        sock.send(JSON.stringify({ id: msg.id, ok: false, error: String(e && e.message || e) }));
       }
     }
   };
-  ws.onclose = () => { setStatus("disconnected"); if (desired) scheduleReconnect(); };
-  ws.onerror = () => { setStatus("error", "connection error"); };
+  // Only the CURRENT socket's close should drive a reconnect. A superseded socket
+  // (replaced by a newer connect, or evicted by the bridge) has ws !== sock → ignored.
+  sock.onclose = () => {
+    if (ws !== sock) return;
+    ws = null;
+    setStatus("disconnected");
+    if (desired) scheduleReconnect();
+  };
+  sock.onerror = () => { if (ws === sock) setStatus("error", "connection error"); };
 }
 
 function scheduleReconnect() {
@@ -95,7 +122,7 @@ function disconnect() {
   // port within 3s. This is the actual "disconnect agent" lever (PLAN.md §7).
   desired = false;
   clearTimeout(reconnectTimer);
-  if (ws) { try { ws.close(); } catch {} ws = null; }
+  teardownSocket();
   setStatus("disconnected");
 }
 
@@ -222,13 +249,13 @@ async function resolveTarget(tool, p) {
   if (EFFECTFUL_OR_NAV.has(tool)) {
     // Explicit tabId required in BOTH configs (the half-wired-invariant fix).
     if (p.tabId == null) {
-      throw denyErr("explicit_tabid_required", tool + " requires an explicit tabId (no active-tab fallback)");
+      throw denyErr("explicit_tabid_required", tool + " requires an explicit tabId. → Call list_tabs first to get a tabId, then pass it as the tabId argument.");
     }
     if (!settings.agentTabControl && p.tabId !== fg) {
-      throw denyErr("tab_control_off", "agentTabControl is OFF: only the foreground tab is reachable");
+      throw denyErr("tab_control_off", "agentTabControl is OFF, so only the foreground (active) tab is reachable. → Ask the user to switch to the tab they want you to use, or to enable multi-tab access in the Ridealong popup settings.");
     }
     if (!(await tabExists(p.tabId))) {
-      throw denyErr("tab_unavailable", "target tab is not available");
+      throw denyErr("tab_unavailable", "that tabId is not an open tab. → Call list_tabs to get a current tabId.");
     }
     return p.tabId;
   }
@@ -236,13 +263,13 @@ async function resolveTarget(tool, p) {
   // Read-only tools (+ get_mode): active-tab fallback permitted.
   if (!settings.agentTabControl) {
     if (p.tabId != null && p.tabId !== fg) {
-      throw denyErr("tab_control_off", "agentTabControl is OFF: only the foreground tab is reachable");
+      throw denyErr("tab_control_off", "agentTabControl is OFF, so only the foreground (active) tab is reachable. → Ask the user to switch to the tab they want you to use, or to enable multi-tab access in the Ridealong popup settings.");
     }
     return fg;
   }
   if (p.tabId != null) {
     if (!(await tabExists(p.tabId))) {
-      throw denyErr("tab_unavailable", "target tab is not available");
+      throw denyErr("tab_unavailable", "that tabId is not an open tab. → Call list_tabs to get a current tabId.");
     }
     return p.tabId;
   }
@@ -636,7 +663,7 @@ async function dispatch(tool, p) {
     const st = getTabState(targetTabId);
     const required = TOOL_TIER[tool];
     if (rank(st.mode) < required) {
-      throw denyErr("insufficient_mode", tool + " requires " + MODE_NAMES[required] + "+, tab is " + st.mode);
+      throw denyErr("insufficient_mode", tool + " needs the '" + MODE_NAMES[required] + "' permission tier or higher, but this tab is currently '" + st.mode + "'. → Ask the user to open the Ridealong popup and set THIS tab to '" + MODE_NAMES[required] + "' (or higher), then retry this exact call. You cannot change the mode yourself.");
     }
 
     // 3. Input validation.

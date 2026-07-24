@@ -1,28 +1,49 @@
 #!/usr/bin/env node
 /**
- * ridealong bridge — an MCP server (stdio) that drives a REAL Firefox through a
+ * ridealong bridge — an MCP server that drives a REAL Firefox through a
  * WebExtension connected over a localhost WebSocket.
  *
- *   AI agent ──MCP/stdio──▶ this bridge ──ws://127.0.0.1──▶ Firefox extension ──▶ page
+ *   AI agent ──MCP/stdio or MCP/HTTP──▶ this bridge ──ws://127.0.0.1──▶ Firefox extension ──▶ page
  *
  * Why: a browser extension can't listen on a port (so it can't BE an MCP server),
  * but it CAN dial out over a WebSocket. This bridge is the missing middle: it
  * speaks MCP to the agent and relays each tool call to the extension, which does
  * the work in the real browser (no CDP, real fingerprint/session).
  *
+ * Two agent-facing transports, ONE relay: this process still exposes the classic
+ * stdio MCP transport (so `claude mcp add ridealong -- node bridge.js` keeps
+ * working — one bridge subprocess per agent), and ALSO a long-lived MCP-over-HTTP
+ * server on a dynamic 127.0.0.1 port, gated by a bearer token + Host/Origin
+ * allowlist. Both transports forward every tool call through the exact same
+ * `callExtension()` relay (same `seq`/`pending` map) into the exact same extension
+ * WebSocket — so multiple agents (Claude, Codex, ...) can share ONE running bridge
+ * over HTTP instead of each fighting over :8765 with their own stdio subprocess.
+ * The extension-facing WS path (protocol, auth, audit) is completely unchanged.
+ *
  * Security: binds 127.0.0.1 only; the extension must present a shared token before
  * any command is accepted. One extension client at a time (the newest wins).
  *
- * stdout is reserved for the MCP protocol — ALL logging goes to stderr.
+ * stdout is reserved for the stdio MCP protocol — ALL logging goes to stderr.
  */
 
-import { readFileSync, mkdirSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import {
+  readFileSync,
+  mkdirSync,
+  writeFileSync,
+  appendFileSync,
+  existsSync,
+  renameSync,
+  unlinkSync,
+  chmodSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
@@ -32,8 +53,27 @@ const log = (...a) => console.error("[ridealong]", ...a);
 
 // ── Token + port ────────────────────────────────────────────────────────
 const PORT = Number(process.env.FXMCP_PORT || 8765);
-const CFG_DIR = join(homedir(), ".firefox-mcp");
+// FXMCP_CFG_DIR is a test-only override (bridge.test.mjs points it at a scratch
+// dir so tests never touch a real user's ~/.firefox-mcp); production always gets
+// the default below.
+const CFG_DIR = process.env.FXMCP_CFG_DIR || join(homedir(), ".firefox-mcp");
 const TOKEN_FILE = join(CFG_DIR, "token.txt");
+
+// Create ~/.firefox-mcp AND enforce 0700 on it even if it already existed. mkdir's
+// `mode` only applies to dirs it newly creates, and resolveToken() below is the
+// FIRST thing to create CFG_DIR — without this re-tighten, a pre-existing (or
+// freshly mkdir'd-at-umask-0755) dir would stay world-readable, and the later
+// {mode:0o700} in writeEndpointAtomic would be a silent no-op. Secrets inside are
+// already 0600; this is defense-in-depth on the containing dir. Best-effort: log
+// and continue on failure (e.g. a dir we don't own) rather than abort.
+function ensureCfgDir() {
+  mkdirSync(CFG_DIR, { recursive: true });
+  try {
+    chmodSync(CFG_DIR, 0o700);
+  } catch (e) {
+    log("could not tighten CFG_DIR permissions on", CFG_DIR + ":", e.message);
+  }
+}
 
 function resolveToken() {
   if (process.env.FXMCP_TOKEN) return process.env.FXMCP_TOKEN.trim();
@@ -42,7 +82,7 @@ function resolveToken() {
   } catch {}
   const t = randomBytes(24).toString("hex");
   try {
-    mkdirSync(CFG_DIR, { recursive: true });
+    ensureCfgDir();
     writeFileSync(TOKEN_FILE, t + "\n", { mode: 0o600 });
   } catch (e) {
     log("could not persist token file:", e.message);
@@ -55,6 +95,88 @@ const TOKEN = resolveToken();
 // the bridge side (revoking an honest/stale extension), delete TOKEN_FILE (or set
 // FXMCP_TOKEN) and RESTART this process so it mints/reads a fresh token, then
 // paste the newly printed value into the extension popup.
+
+// ── Agent-facing HTTP bearer token — DELIBERATELY SEPARATE from TOKEN above.
+// TOKEN authenticates the Firefox extension over WS; HTTP_TOKEN authenticates MCP
+// agents (Claude/Codex/...) over HTTP. Different trust boundaries, different
+// secrets, different files — rotating one never invalidates the other.
+const HTTP_TOKEN_FILE = join(CFG_DIR, "mcp-token.txt");
+function resolveHttpToken() {
+  if (process.env.FXMCP_HTTP_TOKEN) return process.env.FXMCP_HTTP_TOKEN.trim();
+  try {
+    if (existsSync(HTTP_TOKEN_FILE)) return readFileSync(HTTP_TOKEN_FILE, "utf8").trim();
+  } catch {}
+  const t = randomBytes(32).toString("hex"); // 256 bits
+  try {
+    ensureCfgDir();
+    writeFileSync(HTTP_TOKEN_FILE, t + "\n", { mode: 0o600 });
+  } catch (e) {
+    log("could not persist HTTP MCP token file:", e.message);
+  }
+  return t;
+}
+const HTTP_TOKEN = resolveHttpToken();
+
+// ── HTTP auth: bearer token + Host/Origin DNS-rebinding guard ─────────────
+// Lifted from the native-messaging host.js prototype's mintToken/buildAuthConfig/
+// checkAuth. Loopback-only allowlist (no LAN opt-in): a DNS name that merely
+// *resolves* to 127.0.0.1 is still rejected because the Host header itself must
+// be one of the literal loopback forms below — the allowlist is the guard, not
+// name resolution.
+function headerValue(raw) {
+  return Array.isArray(raw) ? raw[0] : raw;
+}
+function constantTimeEqual(a, b) {
+  const ba = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ba.length !== bb.length) return false; // length isn't secret; avoids the mismatched-length throw
+  return timingSafeEqual(ba, bb);
+}
+function buildAuthConfig(token, port) {
+  const hosts = ["127.0.0.1", "localhost", "[::1]"];
+  const allowedHosts = new Set(hosts.map((h) => `${h}:${port}`));
+  const allowedOrigins = new Set(hosts.map((h) => `http://${h}:${port}`));
+  return { token, allowedHosts, allowedOrigins };
+}
+// Order matters: Host is checked first so a rejected origin is turned away before
+// the token (the real secret) is even inspected. Fails closed on any mismatch.
+function checkAuth(headers, cfg) {
+  const host = headerValue(headers["host"])?.toLowerCase();
+  if (!host || !cfg.allowedHosts.has(host)) {
+    return { ok: false, status: 403, reason: "host not allowed" };
+  }
+  const origin = headerValue(headers["origin"]);
+  if (origin !== undefined && !cfg.allowedOrigins.has(origin.toLowerCase())) {
+    return { ok: false, status: 403, reason: "origin not allowed" };
+  }
+  const authz = headerValue(headers["authorization"]) ?? "";
+  const prefix = "Bearer ";
+  const token = authz.startsWith(prefix) ? authz.slice(prefix.length) : "";
+  if (token.length === 0 || !constantTimeEqual(token, cfg.token)) {
+    return { ok: false, status: 401, reason: "invalid token" };
+  }
+  return { ok: true };
+}
+
+// ── Endpoint discovery file ~/.firefox-mcp/endpoint.json ──────────────────
+// One bridge, one endpoint file (unlike the native-messaging host, there's no
+// per-instance id here — this process is the single long-lived singleton).
+// Atomic write (temp file + rename) so a concurrent reader never sees a partial
+// file; 0600/0700 so only this user can read the bearer token off disk.
+const ENDPOINT_FILE = join(CFG_DIR, "endpoint.json");
+function writeEndpointAtomic(data) {
+  ensureCfgDir();
+  const tmp = join(CFG_DIR, `.endpoint.json.tmp-${process.pid}-${randomBytes(4).toString("hex")}`);
+  writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+  renameSync(tmp, ENDPOINT_FILE); // atomic replace on the same filesystem
+}
+function removeEndpointFile() {
+  try {
+    unlinkSync(ENDPOINT_FILE);
+  } catch {
+    /* already gone — fine, this is best-effort cleanup on shutdown */
+  }
+}
 
 // ── Audit log — authoritative sink (PLAN.md §6) ────────────────────────────
 // The extension computes the hash chain (seq/prevHash/hash) and streams each
@@ -162,9 +284,32 @@ wss.on("connection", (ws, req) => {
     }
   });
   ws.on("close", () => {
-    if (ext === ws) { ext = null; log("extension disconnected"); }
+    // Only react to the CURRENTLY-active socket dropping. A superseded socket
+    // (evicted by newest-client-wins above) closing must NOT touch `ext` or the
+    // shared `pending` map — those now belong to the NEW socket, and rejecting
+    // here would kill the new socket's fresh in-flight calls.
+    if (ext !== ws) return;
+    ext = null;
+    log("extension disconnected");
+    // Fail fast: reject every in-flight tool call (stdio + HTTP producers share
+    // this map) instead of letting each hang for its full 30s/45s per-call
+    // timeout. Mirrors host.js's ExtensionRelay.rejectAll.
+    rejectAllPending("Firefox extension disconnected");
   });
 });
+
+// Reject and clear every in-flight call in the shared `pending` map (e.g. on the
+// active extension socket dropping). Snapshot-and-clear first so a reject handler
+// that re-enters callExtension() (repopulating `pending`) can't have its new
+// entry clobbered by this loop.
+function rejectAllPending(reason) {
+  const inflight = [...pending.values()];
+  pending.clear();
+  for (const p of inflight) {
+    clearTimeout(p.timer);
+    p.reject(new Error(reason));
+  }
+}
 
 function callExtension(tool, params, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
@@ -302,16 +447,11 @@ const TOOLS = [
   },
 ];
 
-// ── MCP server ────────────────────────────────────────────────────────────
-const server = new Server(
-  { name: "ridealong", version: "0.1.0" },
-  { capabilities: { tools: {} } },
-);
-
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
-
-server.setRequestHandler(CallToolRequestSchema, async (req) => {
-  const { name, arguments: args = {} } = req.params;
+// ── Shared tool-call handler — used by BOTH the stdio MCP server below AND
+// every per-request HTTP MCP server (see buildMcpServer()). One implementation,
+// one relay (callExtension's shared seq/pending map), so stdio and HTTP agents
+// can never diverge in behavior or collide on in-flight ids.
+async function handleToolCall(name, args = {}) {
   try {
     // ebay_sold_count is composed here from primitive extension ops. PLAN.md §2:
     // this is "not enforceable at the extension" as a single unit — the extension
@@ -350,7 +490,182 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   } catch (e) {
     return { content: [{ type: "text", text: `error: ${e.message}` }], isError: true };
   }
+}
+
+/** Build one MCP `Server` wired to the shared handleToolCall/TOOLS. Used both for
+ *  the single long-lived stdio server and fresh per HTTP request (stateless mode
+ *  requires "a separate Protocol instance per connection" per the SDK's own
+ *  stateless-HTTP example). */
+function buildMcpServer() {
+  const s = new Server({ name: "ridealong", version: "0.1.0" }, { capabilities: { tools: {} } });
+  s.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+  s.setRequestHandler(CallToolRequestSchema, async (req) => {
+    const { name, arguments: args = {} } = req.params;
+    return handleToolCall(name, args);
+  });
+  return s;
+}
+
+// ── MCP server (stdio) — unchanged transport for backward-compat: e.g.
+// `claude mcp add ridealong -- node bridge.js` still spawns this per-agent
+// subprocess and talks stdio. When run standalone (`node bridge.js` with no MCP
+// client attached to stdin), connect() just attaches idle stdin listeners — see
+// StdioServerTransport.start(), it never blocks waiting for a peer — so this is a
+// no-op in that mode and the HTTP + WS + endpoint file below are what matter. ──
+const server = buildMcpServer();
+
+// ── MCP server (HTTP) — the new long-lived, multi-agent transport ─────────
+// Stateless per the SDK's StreamableHTTPServerTransport contract: no session id,
+// fresh Server + transport per request. Every request still funnels into the
+// SAME callExtension()/pending map as the stdio path above — this is purely a
+// second producer into one relay, not a second relay.
+const MAX_BODY = 1_000_000; // 1 MB cap on the agent-facing request body
+class RequestError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+async function readJsonBody(req) {
+  const chunks = [];
+  let size = 0;
+  let oversized = false;
+  for await (const chunk of req) {
+    if (oversized) continue; // keep draining so we can still reply cleanly
+    size += chunk.length;
+    if (size > MAX_BODY) {
+      oversized = true;
+      continue;
+    }
+    chunks.push(chunk);
+  }
+  if (oversized) throw new RequestError(413, "request body too large");
+  if (chunks.length === 0) return undefined;
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    throw new RequestError(400, "invalid JSON body");
+  }
+}
+
+let httpAuthConfig = null; // finalized once the HTTP server's dynamic port is known
+function createHttpMcpServer() {
+  return createServer((req, res) => {
+    void (async () => {
+      try {
+        if (!httpAuthConfig) {
+          res.writeHead(503, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "http mcp server still starting" }));
+          return;
+        }
+        const auth = checkAuth(req.headers, httpAuthConfig);
+        if (!auth.ok) {
+          res.writeHead(auth.status, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: auth.reason }));
+          return;
+        }
+        const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+        if (url.pathname !== "/mcp") {
+          res.writeHead(404, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "not found" }));
+          return;
+        }
+        if (req.method !== "POST") {
+          res.writeHead(405, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "method not allowed" }));
+          return;
+        }
+        const body = await readJsonBody(req);
+        const reqServer = buildMcpServer();
+        const transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined, // stateless: one server+transport per request
+          enableJsonResponse: true,
+        });
+        res.on("close", () => {
+          void transport.close();
+          void reqServer.close();
+        });
+        await reqServer.connect(transport);
+        await transport.handleRequest(req, res, body);
+      } catch (e) {
+        if (e instanceof RequestError) {
+          res.writeHead(e.status, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: e.message }));
+          return;
+        }
+        log("HTTP request handler error:", e.message);
+        if (!res.headersSent) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "internal error" }));
+        }
+      }
+    })();
+  });
+}
+
+// ── Startup: WS server is already listening (see wss.on("listening") above) —
+// bring up the HTTP MCP server on a dynamic port, publish the endpoint file, then
+// connect the stdio transport (harmless no-op if nothing is attached to stdin).
+let endpointWritten = false;
+let shuttingDown = false;
+function cleanupEndpoint() {
+  if (endpointWritten) {
+    removeEndpointFile();
+    endpointWritten = false;
+  }
+}
+
+// HTTP MCP port: FIXED + env-configurable (FXMCP_HTTP_PORT), default 8766. A stable port
+// lets agents register the URL ONCE and have it survive restarts / systemd cycles (the
+// bearer token in endpoint.json also persists). Set FXMCP_HTTP_PORT=0 for a dynamic port.
+const HTTP_PORT_PREF = process.env.FXMCP_HTTP_PORT != null
+  ? parseInt(process.env.FXMCP_HTTP_PORT, 10)
+  : 8766;
+const httpServer = createHttpMcpServer();
+await new Promise((resolve, reject) => {
+  httpServer.once("error", (e) => {
+    if (e.code === "EADDRINUSE") {
+      log(`HTTP MCP port ${HTTP_PORT_PREF} is already in use — another ridealong bridge running? ` +
+          `Stop it, or set FXMCP_HTTP_PORT to a free port (or 0 for a dynamic port).`);
+    } else {
+      log("HTTP MCP server error:", e.message);
+    }
+    reject(e);
+  });
+  httpServer.listen(HTTP_PORT_PREF, "127.0.0.1", resolve);
 });
+const HTTP_PORT = httpServer.address().port; // the actually-bound port (== pref unless 0)
+httpAuthConfig = buildAuthConfig(HTTP_TOKEN, HTTP_PORT);
+const MCP_URL = `http://127.0.0.1:${HTTP_PORT}/mcp`;
+
+writeEndpointAtomic({
+  mcpUrl: MCP_URL,
+  token: HTTP_TOKEN,
+  pid: process.pid,
+  wsPort: PORT,
+});
+endpointWritten = true;
+
+log(`MCP-over-HTTP listening on ${MCP_URL} (bearer token required)`);
+log(`http token: ${HTTP_TOKEN}`);
+log(`(also saved to ${HTTP_TOKEN_FILE}; endpoint published to ${ENDPOINT_FILE})`);
+log(`Register with Claude Code:`);
+log(`  claude mcp add --transport http ridealong ${MCP_URL} --header "Authorization: Bearer ${HTTP_TOKEN}"`);
+log(`Register with Codex:`);
+log(`  codex mcp add --transport http ridealong ${MCP_URL} --header "Authorization: Bearer ${HTTP_TOKEN}"`);
+
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, () => {
+    log(`${sig} received — shutting down`);
+    if (shuttingDown) return;
+    shuttingDown = true;
+    cleanupEndpoint();
+    try { httpServer.close(); } catch {}
+    try { wss.close(); } catch {}
+    process.exit(0);
+  });
+}
+process.on("exit", cleanupEndpoint); // best-effort final safety net
 
 await server.connect(new StdioServerTransport());
-log("MCP server ready on stdio.");
+log("MCP server ready on stdio (+ HTTP above) — one relay, two agent-facing transports.");
