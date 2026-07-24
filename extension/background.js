@@ -669,9 +669,12 @@ async function dispatch(tool, p) {
     // 3. Input validation.
     validateInput(tool, p);
 
-    // 4. Approval (bound to this epoch). run_js ALWAYS prompts, even with auto-approve on.
+    // 4. Approval (bound to this epoch). Every approval-gated tool — including
+    // run_js — honours the tab's auto-approve setting. (run_js executes arbitrary
+    // page JS, so auto-approving it is a deliberate, owner-chosen trust decision:
+    // with auto-approve ON for a tab, run_js runs without a per-call prompt.)
     const epochAtCapture = st.epoch;
-    const needsApproval = tool === "run_js" ? true : (APPROVAL_REQUIRED.has(tool) && !st.autoApprove);
+    const needsApproval = APPROVAL_REQUIRED.has(tool) && !st.autoApprove;
     if (needsApproval) {
       const detail = describeEffect(tool, p);
       const tabTitle = await getTabTitleSafe(targetTabId);
