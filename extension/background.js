@@ -858,7 +858,11 @@ async function regenerateToken() {
 
 // ── popup / approval-page messaging ─────────────────────────────────────────
 function isApprovalSender(sender) {
-  return !sender.tab && typeof sender.url === "string" && sender.url.split("?")[0].endsWith("/approval.html");
+  // Trust the approval page by its URL. (The old `!sender.tab` check wrongly
+  // rejected it: a windows.create popup DOES contain a tab on some Firefox builds,
+  // so sender.tab is set — which left approval_get_detail returning null and the
+  // Approve/Deny buttons permanently disabled, i.e. run_js could never be approved.)
+  return typeof sender.url === "string" && sender.url.split("?")[0].endsWith("/approval.html");
 }
 
 browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
